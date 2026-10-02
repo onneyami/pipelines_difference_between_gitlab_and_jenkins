@@ -1,0 +1,118 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_REGISTRY = 'registry.example.com/apps/my-app'
+        // Jenkins uses GIT_COMMIT instead of CI_COMMIT_SHA
+        IMAGE_TAG       = "${DOCKER_REGISTRY}:${env.GIT_COMMIT}"
+        HELM_CHART_PATH = './charts/my-app'
+        GITOPS_REPO     = 'git@gitlab.example.com:devops/gitops-manifests.git'
+    }
+
+    options {
+        timeout(time: 1, unit: 'HOURS')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    stages {
+        // --- STAGE 1: VALIDATE ---
+        stage('Validate') {
+            agent {
+                docker {
+                    image 'zricethezav/gitleaks:latest'
+                    reuseNode true
+                }
+            }
+            steps {
+                sh 'gitleaks detect --source . --verbose'
+                sh 'helm lint ${HELM_CHART_PATH}'
+            }
+        }
+
+        // --- STAGE 2: TEST ---
+        stage('Test') {
+            agent {
+                docker {
+                    image 'python:3.11-slim'
+                    reuseNode true
+                }
+            }
+            steps {
+                sh '''
+                    python -m venv .venv
+                    . .venv/bin/activate
+                    pip install -r requirements.txt
+                    pytest --cov=src --cov-fail-under=80 --junitxml=report.xml
+                '''
+            }
+            post {
+                always {
+                    junit 'report.xml'
+                }
+            }
+        }
+
+        // --- STAGE 3: BUILD ---
+        stage('Build') {
+            agent {
+                docker {
+                    image 'gcr.io/kaniko-project/executor:v1.20.0-debug'
+                    args '--entrypoint=""'
+                    reuseNode true
+                }
+            }
+            steps {
+                sh '''
+                    /kaniko/executor \
+                      --context "${WORKSPACE}" \
+                      --dockerfile "${WORKSPACE}/Dockerfile" \
+                      --destination "${IMAGE_TAG}" \
+                      --cache=true
+                '''
+            }
+        }
+
+        // --- STAGE 4: SECURITY ---
+        stage('Security') {
+            agent {
+                docker {
+                    image 'aquasec/trivy:latest'
+                    args '--entrypoint=""'
+                    reuseNode true
+                }
+            }
+            steps {
+                sh 'trivy image --exit-code 1 --severity HIGH,CRITICAL ${IMAGE_TAG}'
+            }
+        }
+
+        // --- STAGE 5: DEPLOY (GitOps Pattern) ---
+        stage('Deploy') {
+            when {
+                branch 'main'
+            }
+            agent {
+                docker {
+                    image 'alpine/git:latest'
+                    reuseNode true
+                }
+            }
+            steps {
+                // Secret injected via Jenkins Credentials Store
+                withCredentials([sshUserPrivateKey(credentialsId: 'gitops-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+                    sh '''
+                        git config --global user.email "jenkins-bot@example.com"
+                        git config --global user.name "Jenkins Bot"
+                        git clone ${GITOPS_REPO} gitops-repo
+                        cd gitops-repo/environments/production
+                        sed -i "s|image: .*|image: ${IMAGE_TAG}|g" values.yaml
+                        git add values.yaml
+                        git commit -m "ci: update image to ${GIT_COMMIT} [skip ci]"
+                        git push origin main
+                    '''
+                }
+            }
+        }
+    }
+}

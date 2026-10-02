@@ -1,0 +1,86 @@
+stages:
+  - validate
+  - test
+  - build
+  - security
+  - deploy
+
+variables:
+  DOCKER_REGISTRY: "registry.example.com/apps/my-app"
+  IMAGE_TAG: "$DOCKER_REGISTRY:$CI_COMMIT_SHA"
+  HELM_CHART_PATH: "./charts/my-app"
+  GITOPS_REPO: "git@gitlab.example.com:devops/gitops-manifests.git"
+
+# --- GLOBAL CACHING ---
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - .cache/pip
+    - .venv/
+
+# --- STAGE 1: VALIDATE ---
+secret-and-iac-lint:
+  stage: validate
+  image: zricethezav/gitleaks:latest
+  script:
+    # 1. Check for committed hardcoded credentials/tokens
+    - gitleaks detect --source . --verbose
+    # 2. Lint Helm charts
+    - helm lint ${HELM_CHART_PATH}
+
+# --- STAGE 2: TEST ---
+unit-testing:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - pip install -r requirements.txt
+  script:
+    # Fail pipeline if test coverage drops below 80%
+    - pytest --cov=src --cov-fail-under=80 --junitxml=report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+
+# --- STAGE 3: BUILD ---
+build-container-image:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.20.0-debug
+    entrypoint: [""]
+  script:
+    # Rootless docker build using Kaniko
+    - /kaniko/executor 
+        --context "${CI_PROJECT_DIR}" 
+        --dockerfile "${CI_PROJECT_DIR}/Dockerfile" 
+        --destination "${IMAGE_TAG}" 
+        --cache=true
+
+# --- STAGE 4: SECURITY ---
+trivy-vulnerabilities-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    # Fail build on CRITICAL/HIGH vulnerabilities
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL ${IMAGE_TAG}
+
+# --- STAGE 5: DEPLOY (GitOps Pattern) ---
+update-gitops-manifest:
+  stage: deploy
+  image: alpine/git:latest
+  script:
+    # Clone the infrastructure repo and update image tag (GitOps approach)
+    - git config --global user.email "ci-bot@example.com"
+    - git config --global user.name "CI Bot"
+    - git clone ${GITOPS_REPO} gitops-repo
+    - cd gitops-repo/environments/production
+    - sed -i "s|image: .*|image: ${IMAGE_TAG}|g" values.yaml
+    - git add values.yaml
+    - git commit -m "ci: update image to ${CI_COMMIT_SHA} [skip ci]"
+    - git push origin main
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
